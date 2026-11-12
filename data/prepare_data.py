@@ -1,80 +1,97 @@
 
 import torch
 from pathlib import Path
+from tokenizers import Tokenizer
 
-from tokenizer.char_tokenizer import CharTokenizer
 
+# ==========================================
+# PATHS
+# ==========================================
 
-# Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-INPUT_FILE = PROJECT_ROOT / "data" / "input.txt"
-TRAIN_FILE = PROJECT_ROOT / "data" / "train.pt"
-VAL_FILE = PROJECT_ROOT / "data" / "val.pt"
-VOCAB_FILE = PROJECT_ROOT / "tokenizer" / "vocab.json"
+TRAIN_TEXT = PROJECT_ROOT / "data" / "input.txt"
+VAL_TEXT = PROJECT_ROOT / "data" / "wikitext_validation.txt"
 
+TOKENIZER_FILE = PROJECT_ROOT / "tokenizer" / "cipai_bpe.json"
+
+TRAIN_OUTPUT = PROJECT_ROOT / "data" / "train_bpe.pt"
+VAL_OUTPUT = PROJECT_ROOT / "data" / "val_bpe.pt"
+
+
+# ==========================================
+# LOAD TOKENIZER
+# ==========================================
+
+def load_tokenizer():
+
+    print("Loading BPE tokenizer...")
+
+    if not TOKENIZER_FILE.exists():
+        raise FileNotFoundError("BPE tokenizer not found.")
+
+    return Tokenizer.from_file(str(TOKENIZER_FILE))
+
+
+# ==========================================
+# ENCODE TEXT
+# ==========================================
+
+def encode_file(path, tokenizer):
+
+    print(f"\nReading: {path.name}")
+
+    text = path.read_text(encoding="utf-8")
+
+    print("Characters:", len(text))
+
+    encoded = tokenizer.encode(text)
+
+    token_ids = torch.tensor(
+        encoded.ids,
+        dtype=torch.long
+    )
+
+    print("Tokens:", len(token_ids))
+
+    return token_ids
+
+
+# ==========================================
+# PREPARE DATASET
+# ==========================================
 
 def prepare_data():
 
-    print("Loading dataset...")
+    print("Preparing cipAI BPE datasets...")
 
-    # Read original text
-    text = INPUT_FILE.read_text(encoding="utf-8")
+    tokenizer = load_tokenizer()
 
-    if len(text) < 100:
-        raise ValueError("Dataset is too small")
-
-    print("Total characters:", len(text))
-
-    # Split text before building vocabulary
-    split_index = int(len(text) * 0.90)
-
-    train_text = text[:split_index]
-    val_text = text[split_index:]
-
-    print("Training characters:", len(train_text))
-    print("Validation characters:", len(val_text))
-
-    # Build tokenizer using training text only
-    tokenizer = CharTokenizer(text=train_text)
-
-    print("Vocabulary size:", len(tokenizer.vocab))
-
-    # Save vocabulary for future inference
-    tokenizer.save(VOCAB_FILE)
-
-    # Convert text into token IDs
-    train_ids = tokenizer.encode(train_text)
-    val_ids = tokenizer.encode(val_text)
-
-    # Count unknown characters in validation data
-    unk_id = tokenizer.char_to_id[tokenizer.unk_token]
-
-    unknown_count = val_ids.count(unk_id)
-
-    print("Unknown validation characters:", unknown_count)
-
-    # Convert token IDs into PyTorch tensors
-    train_tensor = torch.tensor(
-        train_ids,
-        dtype=torch.long
+    train_data = encode_file(
+        TRAIN_TEXT,
+        tokenizer
     )
 
-    val_tensor = torch.tensor(
-        val_ids,
-        dtype=torch.long
+    val_data = encode_file(
+        VAL_TEXT,
+        tokenizer
     )
 
-    # Save encoded datasets
-    torch.save(train_tensor, TRAIN_FILE)
-    torch.save(val_tensor, VAL_FILE)
+    if len(train_data) <= 512 or len(val_data) <= 512:
+        raise ValueError("Dataset is too small.")
 
-    print("\nData preparation completed!")
-    print("Training tensor:", train_tensor.shape)
-    print("Validation tensor:", val_tensor.shape)
-    print("Vocabulary saved:", VOCAB_FILE)
-    print("Training data saved:", TRAIN_FILE)
-    print("Validation data saved:", VAL_FILE)
+    torch.save(train_data, TRAIN_OUTPUT)
+    torch.save(val_data, VAL_OUTPUT)
+
+    print("\nDataset preparation completed!")
+
+    print("BPE vocabulary:", tokenizer.get_vocab_size())
+    print("Training tokens:", len(train_data))
+    print("Validation tokens:", len(val_data))
+
+    print("\nSaved files:")
+    print(TRAIN_OUTPUT)
+    print(VAL_OUTPUT)
 
 
 if __name__ == "__main__":

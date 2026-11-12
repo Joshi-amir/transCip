@@ -1,42 +1,39 @@
+
 import torch
 import torch.nn as nn
 from pathlib import Path
-import json
-import sys 
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))  # <-- Add this line so Python finds 'models'
+from tokenizers import Tokenizer
+from contextlib import nullcontext
 
 from models.gpt import GPTLanguageModel
-from torch.amp import autocast, GradScaler
 
 
 # ==========================================
-# CONFIGURATION (~40-50M Parameter Scale)
+# CONFIGURATION
 # ==========================================
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+TRAIN_FILE = PROJECT_ROOT / "data" / "train_bpe.pt"
+VAL_FILE = PROJECT_ROOT / "data" / "val_bpe.pt"
 
-TRAIN_FILE = PROJECT_ROOT / "data" / "train.pt"
-VAL_FILE = PROJECT_ROOT / "data" / "val.pt"
-VOCAB_FILE = PROJECT_ROOT / "tokenizer" / "vocab.json"
+TOKENIZER_FILE = PROJECT_ROOT / "tokenizer" / "cipai_bpe.json"
 
 CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints"
-BEST_MODEL_FILE = CHECKPOINT_DIR / "best_model.pt"
+BEST_MODEL_FILE = CHECKPOINT_DIR / "cipai_v2_bpe.pt"
 
-# Model configuration (Scaled up for RTX 4060 8GB VRAM)
 EMBEDDING_DIM = 512
 NUM_HEADS = 8
 NUM_LAYERS = 12
 CONTEXT_LENGTH = 512
 DROPOUT = 0.1
 
-# Training configuration
-BATCH_SIZE = 16
+BATCH_SIZE = 4
 BLOCK_SIZE = 512
+
 MAX_ITERS = 5000
 EVAL_INTERVAL = 500
-EVAL_ITERS = 50
+EVAL_ITERS = 20
 
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 0.01
@@ -46,7 +43,7 @@ SEED = 1337
 
 
 # ==========================================
-# DEVICE AND REPRODUCIBILITY
+# DEVICE
 # ==========================================
 
 torch.manual_seed(SEED)
@@ -56,10 +53,23 @@ if torch.cuda.is_available():
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+USE_BF16 = (
+    device == "cuda"
+    and torch.cuda.is_bf16_supported()
+)
+
+def autocast_context():
+    if USE_BF16:
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+
+    return nullcontext()
+
+
 print("Training device:", device)
 
 if device == "cuda":
     print("GPU:", torch.cuda.get_device_name(0))
+    print("BF16:", USE_BF16)
 
 
 # ==========================================
@@ -70,7 +80,7 @@ def load_data():
 
     if not TRAIN_FILE.exists() or not VAL_FILE.exists():
         raise FileNotFoundError(
-            "Training data missing. Run data.prepare_data first."
+            "BPE datasets missing. Run data/prepare_data.py first."
         )
 
     train_data = torch.load(
@@ -86,16 +96,16 @@ def load_data():
     )
 
     if len(train_data) <= BLOCK_SIZE:
-        raise ValueError("Training dataset is too small")
+        raise ValueError("Training dataset too small.")
 
     if len(val_data) <= BLOCK_SIZE:
-        raise ValueError("Validation dataset is too small")
+        raise ValueError("Validation dataset too small.")
 
     return train_data, val_data
 
 
 # ==========================================
-# CREATE RANDOM TRAINING BATCHES
+# CREATE BATCHES
 # ==========================================
 
 def get_batch(data):
@@ -137,14 +147,18 @@ def estimate_loss(model, train_data, val_data):
         losses = torch.zeros(EVAL_ITERS)
 
         for i in range(EVAL_ITERS):
+
             x, y = get_batch(data)
-            with autocast('cuda', dtype=torch.bfloat16):
+
+            with autocast_context():
                 _, loss = model(x, y)
+
             losses[i] = loss.item()
 
         results[name] = losses.mean().item()
 
     model.train()
+
     return results
 
 
@@ -156,16 +170,16 @@ def train():
 
     train_data, val_data = load_data()
 
-    with open(VOCAB_FILE, "r", encoding="utf-8") as file:
-        vocab = json.load(file)
+    tokenizer = Tokenizer.from_file(
+        str(TOKENIZER_FILE)
+    )
 
-    vocab_size = len(vocab)
+    vocab_size = tokenizer.get_vocab_size()
 
     print("Vocabulary size:", vocab_size)
-    print("Training characters:", len(train_data))
-    print("Validation characters:", len(val_data))
+    print("Training tokens:", len(train_data))
+    print("Validation tokens:", len(val_data))
 
-    # Create model (~40-50M parameters)
     model = GPTLanguageModel(
         vocab_size=vocab_size,
         embedding_dim=EMBEDDING_DIM,
@@ -176,21 +190,19 @@ def train():
     ).to(device)
 
     total_parameters = sum(
-        parameter.numel()
-        for parameter in model.parameters()
+        p.numel() for p in model.parameters()
     )
 
-    print(f"Total parameters: {total_parameters:,} (~{total_parameters / 1e6:.1f}M)")
+    print(
+        f"Total parameters: {total_parameters:,} "
+        f"(~{total_parameters / 1e6:.1f}M)"
+    )
 
-    # AdamW optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY
     )
-
-    # Initialize GradScaler for mixed precision (bfloat16)
-    scaler = GradScaler('cuda')
 
     CHECKPOINT_DIR.mkdir(
         parents=True,
@@ -198,6 +210,9 @@ def train():
     )
 
     best_val_loss = float("inf")
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     initial = estimate_loss(
         model,
@@ -209,32 +224,36 @@ def train():
     print(f"Train: {initial['train']:.4f}")
     print(f"Validation: {initial['val']:.4f}")
 
-    # Main training loop
+    # ======================================
+    # MAIN TRAINING LOOP
+    # ======================================
+
     for step in range(MAX_ITERS):
 
         model.train()
+
         x, y = get_batch(train_data)
 
-        # Mixed precision forward pass
-        with autocast('cuda', dtype=torch.bfloat16):
+        with autocast_context():
             _, loss = model(x, y)
 
         if not torch.isfinite(loss):
-            raise RuntimeError("Training loss became invalid")
+            raise RuntimeError("Training loss became invalid.")
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Scaled backpropagation
-        scaler.scale(loss).backward()
+        loss.backward()
 
-        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(
             model.parameters(),
             GRAD_CLIP
         )
 
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
+
+        # ==================================
+        # EVALUATION
+        # ==================================
 
         if step % EVAL_INTERVAL == 0 or step == MAX_ITERS - 1:
 
@@ -274,7 +293,11 @@ def train():
                     BEST_MODEL_FILE
                 )
 
-                print("Best model checkpoint saved!")
+                print("Best v2 checkpoint saved!")
+
+    # ======================================
+    # COMPLETION
+    # ======================================
 
     print("\nTraining completed!")
     print("Best validation loss:", round(best_val_loss, 4))
