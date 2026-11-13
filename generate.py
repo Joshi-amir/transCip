@@ -6,64 +6,60 @@ from tokenizers import Tokenizer
 from models.gpt import GPTLanguageModel
 
 
-# ==========================================
-# PATHS AND DEVICE
-# ==========================================
-
+# Paths and device
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 CHECKPOINT_FILE = (
-    PROJECT_ROOT / "models" / "checkpoints" / "cipai_v2_bpe.pt"
+    PROJECT_ROOT / "models" / "checkpoints" / "cipai_clean_v2.pt"
 )
 
 TOKENIZER_FILE = (
-    PROJECT_ROOT / "tokenizer" / "cipai_bpe.json"
+    PROJECT_ROOT / "tokenizer" / "cipai_clean_bpe.json"
 )
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ==========================================
-# LOAD TOKENIZER
-# ==========================================
+def load_model():
+    if not CHECKPOINT_FILE.exists():
+        raise FileNotFoundError(
+            f"Model checkpoint not found: {CHECKPOINT_FILE}"
+        )
 
-tokenizer = Tokenizer.from_file(str(TOKENIZER_FILE))
+    if not TOKENIZER_FILE.exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found: {TOKENIZER_FILE}"
+        )
 
+    tokenizer = Tokenizer.from_file(str(TOKENIZER_FILE))
 
-# ==========================================
-# LOAD MODEL
-# ==========================================
+    checkpoint = torch.load(
+        CHECKPOINT_FILE,
+        map_location=DEVICE,
+        weights_only=True
+    )
 
-checkpoint = torch.load(
-    CHECKPOINT_FILE,
-    map_location=DEVICE,
-    weights_only=True
-)
+    config = checkpoint["model_config"]
 
-config = checkpoint["model_config"]
+    model = GPTLanguageModel(**config).to(DEVICE)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
 
-model = GPTLanguageModel(**config).to(DEVICE)
+    return model, tokenizer, config
 
-model.load_state_dict(checkpoint["model_state_dict"])
-
-model.eval()
-
-print("cipAI v2 loaded successfully!")
-print("Device:", DEVICE)
-print("Parameters:", sum(p.numel() for p in model.parameters()))
-
-
-# ==========================================
-# GENERATE TEXT
-# ==========================================
 
 @torch.inference_mode()
 def generate_text(
     prompt,
+    model,
+    tokenizer,
+    config,
     max_new_tokens=200,
     temperature=0.8,
     top_k=50
 ):
+    if temperature <= 0:
+        raise ValueError("Temperature must be greater than zero.")
 
     encoded = tokenizer.encode(prompt)
 
@@ -77,15 +73,14 @@ def generate_text(
     )
 
     for _ in range(max_new_tokens):
-
         idx_context = idx[:, -config["context_length"]:]
 
         logits, _ = model(idx_context)
 
         logits = logits[:, -1, :] / temperature
 
-        # Keep only the top-k most likely tokens.
-        values, _ = torch.topk(logits, top_k)
+        k = min(top_k, logits.size(-1))
+        values, _ = torch.topk(logits, k)
 
         logits[logits < values[:, [-1]]] = float("-inf")
 
@@ -101,27 +96,43 @@ def generate_text(
     return tokenizer.decode(idx[0].tolist())
 
 
-# ==========================================
-# INTERACTIVE LOOP
-# ==========================================
+def main():
+    model, tokenizer, config = load_model()
 
-print("\nType 'exit' to quit.")
+    parameters = sum(
+        parameter.numel() for parameter in model.parameters()
+    )
 
-while True:
+    print("cipAI Clean V2 loaded successfully!")
+    print("Device:", DEVICE)
+    print("Parameters:", f"{parameters:,}")
+    print("Vocabulary:", tokenizer.get_vocab_size())
 
-    prompt = input("\nYou: ").strip()
+    print("\nType 'exit' to quit.")
 
-    if prompt.lower() == "exit":
-        print("Closing cipAI.")
-        break
+    while True:
+        prompt = input("\nYou: ").strip()
 
-    if not prompt:
-        continue
+        if prompt.lower() == "exit":
+            print("Closing cipAI.")
+            break
 
-    try:
-        output = generate_text(prompt)
+        if not prompt:
+            continue
 
-        print("\ncipAI:", output)
+        try:
+            output = generate_text(
+                prompt,
+                model,
+                tokenizer,
+                config
+            )
 
-    except Exception as error:
-        print("Generation error:", error)
+            print("\ncipAI:", output)
+
+        except Exception as error:
+            print("Generation error:", error)
+
+
+if __name__ == "__main__":
+    main()
